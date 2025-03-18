@@ -35,7 +35,7 @@ if not OPENAI_API_KEY:
 
 # Get model names from environment variables with defaults
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-3-7-sonnet-20250219")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "o3-mini")
 
 print(f"Using Claude model: {CLAUDE_MODEL}")
 print(f"Using OpenAI model: {OPENAI_MODEL}")
@@ -126,7 +126,7 @@ def chatgpt_refine(claude_response, task_description):
             # Using modern OpenAI client format
             response = openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
-                temperature=0.5,
+                # temperature=0.5,
                 messages=[
                     {
                         "role": "system", 

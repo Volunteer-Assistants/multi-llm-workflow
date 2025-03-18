@@ -1,12 +1,12 @@
 # Multi-LLM Workflow
 
-This repository demonstrates how to orchestrate **Claude** (3.7 Sonnet) and **ChatGPT** (GPT-4/o1) to collaboratively generate and refine code. By leveraging the strengths of multiple language models in a sequential pipeline, you can create higher quality code than using a single model alone.
+This repository demonstrates how to orchestrate **Claude** (3.7 Sonnet) and **ChatGPT** (GPT-4/o3-mini) to collaboratively generate and refine code. By leveraging the strengths of multiple language models in a sequential pipeline, you can create higher quality code than using a single model alone.
 
 ## How It Works
 
 1. **User** inputs a coding prompt
 2. **Claude** (Anthropic's 3.7 Sonnet) provides the initial code and explanation
-3. **ChatGPT** (OpenAI's GPT-4) reviews and refines Claude's code
+3. **ChatGPT** (OpenAI's GPT-4 or o3-mini) reviews and refines Claude's code
 4. The final code is displayed to the user and can be saved to a file
 
 This workflow demonstrates how different AI models can be combined to produce better results by using each model for what it does best.
@@ -109,7 +109,7 @@ You can modify the models used in the workflow by editing these environment vari
 ```
 # Optional Configuration
 CLAUDE_MODEL="claude-3-7-sonnet-20250219"
-OPENAI_MODEL="gpt-4"  # or "o1" for GPT-4o
+OPENAI_MODEL="gpt-4"  # or "o3-mini" for coding
 ```
 
 Or directly edit the model variables in the Python files:
