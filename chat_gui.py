@@ -1,16 +1,23 @@
 import os
 import time
 import sys
-from openai import OpenAI  # Modern OpenAI client
+import re
+from openai import OpenAI
 from anthropic import Anthropic, AuthenticationError, APIError, RateLimitError
 from dotenv import load_dotenv
 import gradio as gr
+
+# Import our multi-model workflow
+from multi_model_workflow import ai_collaboration
 
 """
 chat_gui.py
 
 This script provides a web-based chat interface where Claude and ChatGPT
-talk directly to each other in a conversational format.
+talk directly to each other in a conversational format. It now includes:
+- File attachments (text files)
+- Persistent conversation memory
+- GitHub context enrichment via MCP
 
 Usage:
     python chat_gui.py
@@ -42,177 +49,129 @@ print(f"Using OpenAI model: {OPENAI_MODEL}")
 
 # Initialize API clients using modern formats
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)  # Modern OpenAI client
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-def claude_generate(prompt, task_description):
+# Persistent conversation memory for the session
+conversation_memory = []
+MAX_MEMORY_ENTRIES = 10  # Limit to prevent very long contexts
+
+def update_memory(role, content):
+    """Add a new entry to the conversation memory with metadata"""
+    conversation_memory.append({
+        "role": role,
+        "content": content,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    })
+    
+    # If we exceed the max entries, remove the oldest one (but keep at least one entry)
+    if len(conversation_memory) > MAX_MEMORY_ENTRIES:
+        conversation_memory.pop(0)
+
+def format_conversation_history():
+    """Format the memory into a string for the models to process"""
+    if not conversation_memory:
+        return ""
+    
+    history = "--- Previous Conversation History ---\n\n"
+    for entry in conversation_memory:
+        history += f"[{entry['role']}] ({entry['timestamp']}): {entry['content']}\n\n"
+    history += "--- End of History ---\n\n"
+    
+    return history
+
+def process_file_content(file_obj):
     """
-    Get a response from Claude using the Messages API with a conversational tone
-    where Claude addresses ChatGPT directly
+    Extract text content from an uploaded file
+    Returns the content as string or None if the file couldn't be processed
     """
-    max_retries = 3
-    retry_delay = 2
-    
-    claude_system_prompt = f"""
-    You are Claude, an AI assistant by Anthropic. You'll be collaborating with ChatGPT (by OpenAI) 
-    to help solve the user's request.
-    
-    Address ChatGPT directly in your response, like you're having a conversation with a colleague.
-    First, analyze the user's request: {task_description}
-    
-    Then generate a response that:
-    1. Briefly introduces yourself to ChatGPT
-    2. Outlines your approach to solving the user's request
-    3. Provides your implementation, code, or answer
-    4. IMPORTANT: Ends by specifically asking ChatGPT to review, improve, or enhance your response
-    5. Signs off with your name "- Claude"
-    
-    Keep your tone professional, clear, and collaborative.
-    """
-    
-    for attempt in range(max_retries):
-        try:
-            response = anthropic_client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=1500,
-                temperature=0.7,
-                system=claude_system_prompt,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ]
-            )
+    if file_obj is None:
+        return None
+        
+    try:
+        # Check file size
+        MAX_FILE_SIZE = 1024 * 1024  # 1MB limit
+        
+        # Check the file size in memory (for bytes) or on disk
+        if isinstance(file_obj, bytes):
+            file_size = len(file_obj)
+        else:
+            file_obj.seek(0, os.SEEK_END)
+            file_size = file_obj.tell()
+            file_obj.seek(0)
             
-            return response.content[0].text
+        if file_size > MAX_FILE_SIZE:
+            return "ERROR: File exceeds the maximum size limit of 1MB."
             
-        except RateLimitError:
-            if attempt < max_retries - 1:
-                wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
-                print(f"Claude API rate limit hit. Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            else:
-                return "⚠️ Error: Claude API rate limit exceeded. Please try again later."
-        except AuthenticationError:
-            return "⚠️ Error: Claude API authentication failed. Please check your API key."
-        except APIError as e:
-            return f"⚠️ Error with Claude API: {str(e)}"
-        except Exception as e:
-            return f"⚠️ Unexpected error with Claude API: {str(e)}"
-
-def chatgpt_refine(claude_response, task_description):
-    """
-    Send Claude's output to ChatGPT for refinement,
-    with ChatGPT responding directly to Claude
-    """
-    max_retries = 3
-    retry_delay = 2
-    
-    chatgpt_system_prompt = f"""
-    You are ChatGPT, an AI assistant by OpenAI. You're collaborating with Claude (by Anthropic)
-    on solving the user's request: {task_description}
-    
-    Claude has provided their implementation and asked you to review it.
-    
-    Your response should:
-    1. Begin with a brief greeting to Claude, addressing them by name
-    2. Provide constructive feedback on Claude's implementation
-    3. Offer specific improvements, enhancements, or corrections
-    4. Include a complete, improved implementation when applicable (especially for code)
-    5. End with a friendly sign-off like "- ChatGPT"
-    
-    Keep your tone positive, helpful, and collaborative, like you're working with a respected colleague.
-    """
-    
-    for attempt in range(max_retries):
-        try:
-            # Using modern OpenAI client format
-            response = openai_client.chat.completions.create(
-                model=OPENAI_MODEL,
-                # temperature=0.5,
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": chatgpt_system_prompt
-                    },
-                    {
-                        "role": "user", 
-                        "content": claude_response
-                    }
-                ]
-            )
+        # Extract content - assume text file
+        file_content = file_obj.decode("utf-8") if isinstance(file_obj, bytes) else file_obj.read().decode("utf-8")
+        
+        # Truncate if it's extremely long
+        MAX_CONTENT_LENGTH = 20000  # ~20KB of text
+        if len(file_content) > MAX_CONTENT_LENGTH:
+            file_content = file_content[:MAX_CONTENT_LENGTH] + "\n...[content truncated due to length]..."
             
-            # New response format for modern client
-            return response.choices[0].message.content
-            
-        except Exception as e:
-            if attempt < max_retries - 1:
-                wait_time = retry_delay * (2 ** attempt)
-                print(f"OpenAI API error. Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            else:
-                return f"⚠️ Error with OpenAI API: {str(e)}"
+        return file_content
+        
+    except UnicodeDecodeError:
+        return "ERROR: Could not process the file. Make sure it's a text file."
+    except Exception as e:
+        return f"ERROR: {str(e)}"
 
-def ai_collaboration(user_prompt, chat_history=None):
-    """
-    Facilitates a conversation between Claude and ChatGPT to solve the user's prompt
-    """
-    # Show status message
-    progress_message = "⏳ Starting AI collaboration between Claude and ChatGPT..."
-    yield progress_message
-    
-    # Get Claude's initial response
-    print(f"Claude ({CLAUDE_MODEL}) is generating a response...")
-    claude_text = claude_generate(user_prompt, user_prompt)
-    if claude_text.startswith("⚠️ Error"):
-        yield claude_text
-        return
-    
-    # First yield Claude's response to show progress
-    yield f"<div class='claude-message'><h3>🟣 Claude ({CLAUDE_MODEL.split('-')[2].capitalize() if '-' in CLAUDE_MODEL else CLAUDE_MODEL})</h3>\n\n{claude_text}</div>"
-    
-    # Get ChatGPT's refinement
-    print(f"ChatGPT ({OPENAI_MODEL}) is reviewing and refining...")
-    chatgpt_text = chatgpt_refine(claude_text, user_prompt)
-    if chatgpt_text.startswith("⚠️ Error"):
-        yield f"<div class='claude-message'><h3>🟣 Claude ({CLAUDE_MODEL.split('-')[2].capitalize() if '-' in CLAUDE_MODEL else CLAUDE_MODEL})</h3>\n\n{claude_text}</div>\n\n{chatgpt_text}"
-        return
-
-    # Get model display names
-    claude_display = CLAUDE_MODEL.split('-')[2].capitalize() if '-' in CLAUDE_MODEL else CLAUDE_MODEL
-    openai_display = OPENAI_MODEL.replace("-", " ").title()
-
-    # Combine responses with clear visual separation
-    combined_text = f"""
-<div class='claude-message'><h3>🟣 Claude ({claude_display})</h3>
-
-{claude_text}
-</div>
-
-<div class='chatgpt-message'><h3>🟢 ChatGPT ({openai_display})</h3>
-
-{chatgpt_text}
-</div>
-"""
-    yield combined_text
-
-def chat_interface(user_message, chat_history):
+def chat_interface(user_message, file_upload, chat_history):
     """
     Gradio chat function that shows the conversation between the AIs
+    Now processes file uploads and maintains conversation memory
     """
+    # Process file if uploaded
+    file_content = None
+    if file_upload is not None:
+        try:
+            file_content = process_file_content(file_upload)
+            if file_content and file_content.startswith("ERROR:"):
+                chat_history.append((f"File upload: {file_upload.name}", file_content))
+                return "", None, chat_history
+        except Exception as e:
+            error_msg = f"⚠️ Error processing file: {str(e)}"
+            chat_history.append((f"File upload: {file_upload.name}", error_msg))
+            return "", None, chat_history
+    
+    # Get conversation context
+    conversation_context = format_conversation_history()
+    
     # Update chat history with the user message immediately
-    chat_history.append((user_message, ""))
-    yield "", chat_history
+    upload_note = f" [with file: {file_upload.name}]" if file_upload else ""
+    chat_history.append((user_message + upload_note, ""))
+    yield "", None, chat_history
     
     # Generate responses
     bot_message = ""
-    for message in ai_collaboration(user_message, chat_history):
+    for message in ai_collaboration(user_message, file_content, conversation_context):
         # Update the last message
         bot_message = message
-        chat_history[-1] = (user_message, bot_message)
-        yield "", chat_history
+        chat_history[-1] = (user_message + upload_note, bot_message)
+        yield "", None, chat_history
+    
+    # Extract content for memory (stripping HTML)
+    if bot_message:
+        # Parse Claude's response from the combined output
+        claude_match = re.search(r'<div class=\'claude-message\'><h3>.*?</h3>\s*\n\n(.*?)\s*</div>', bot_message, re.DOTALL)
+        if claude_match:
+            claude_text = claude_match.group(1).strip()
+            update_memory("Claude", claude_text)
+        
+        # Parse ChatGPT's response from the combined output
+        chatgpt_match = re.search(r'<div class=\'chatgpt-message\'><h3>.*?</h3>\s*\n\n(.*?)\s*</div>', bot_message, re.DOTALL)
+        if chatgpt_match:
+            chatgpt_text = chatgpt_match.group(1).strip()
+            update_memory("ChatGPT", chatgpt_text)
+        
+        # Update user message in memory
+        update_memory("User", user_message + (f" [with attached file]" if file_content else ""))
 
 # Updated CSS to meet the requested refinements
 custom_css = """
-/* 1) Ensure Claude’s text is black (or near-black) */
-/* Force Claude’s bubble text to true black */
+/* 1) Ensure Claude's text is black (or near-black) */
+/* Force Claude's bubble text to true black */
 .claude-message {
     float: left;
     clear: both;
@@ -322,6 +281,33 @@ textarea::placeholder, input::placeholder {
 button {
     color: #111827 !important;
 }
+
+/* File upload area styling */
+.file-upload {
+    margin-top: 10px;
+    margin-bottom: 10px;
+    padding: 10px;
+    border: 2px dashed #ccc;
+    border-radius: 8px;
+    background-color: #f8f9fa;
+}
+
+/* Memory indicator */
+.memory-indicator {
+    font-size: 0.8em;
+    color: #666;
+    text-align: right;
+    margin-bottom: 5px;
+}
+
+/* GitHub section styling */
+.github-section {
+    padding: 10px;
+    background-color: #f4f6f8;
+    border-left: 4px solid #0366d6;
+    margin-bottom: 10px;
+    border-radius: 0 6px 6px 0;
+}
 """
 
 # Get model display names for UI
@@ -338,8 +324,14 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Default()) as demo:
     2. Claude analyzes it and creates an initial response
     3. ChatGPT reviews Claude's work and provides improvements
     
-    Watch as the two AI systems work together to create a better result than either could alone!
+    **New Features:**
+    - Upload text files for the models to analyze
+    - Conversation memory allows models to reference previous exchanges
+    - GitHub integration via MCP for repository context
     """)
+    
+    # Memory indicator
+    memory_indicator = gr.Markdown("", elem_classes=["memory-indicator"])
     
     # Display chat with reduced height
     chatbot = gr.Chatbot(
@@ -351,11 +343,18 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Default()) as demo:
         avatar_images=(None, "🤖")
     )
     
+    # File upload component
+    file_upload = gr.File(
+        label="Upload a text file (optional, max 1MB)",
+        file_count="single",
+        file_types=[".txt", ".md", ".py", ".js", ".html", ".css", ".json", ".csv"]
+    )
+    
     # Row for the user's text entry
     with gr.Row():
         msg = gr.Textbox(
             label="Enter your task or question here",
-            placeholder="For example: Write a Python function that checks if a number is prime",
+            placeholder="For example: Write a Python function that checks if a number is prime or analyze repository openai/openai-python",
             lines=3,
             max_lines=10,
             show_label=False,
@@ -371,14 +370,24 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Default()) as demo:
     model_info = gr.Markdown(f"**Models:** Claude = `{CLAUDE_MODEL}` | ChatGPT = `{OPENAI_MODEL}`")
 
     def clear_history():
-        return []
+        global conversation_memory
+        conversation_memory = []
+        return [], None, "Memory cleared"
+
+    def update_memory_indicator():
+        if not conversation_memory:
+            return "No conversation history"
+        return f"Memory: {len(conversation_memory)} entries from current session"
 
     # Connect components
-    msg.submit(chat_interface, [msg, chatbot], [msg, chatbot])
-    submit_btn.click(chat_interface, [msg, chatbot], [msg, chatbot])
-    clear.click(fn=clear_history, inputs=[], outputs=[chatbot])
+    msg.submit(chat_interface, [msg, file_upload, chatbot], [msg, file_upload, chatbot])
+    submit_btn.click(chat_interface, [msg, file_upload, chatbot], [msg, file_upload, chatbot])
+    clear.click(clear_history, inputs=[], outputs=[chatbot, file_upload, memory_indicator])
+    
+    # Update memory indicator periodically
+    demo.load(update_memory_indicator, inputs=None, outputs=[memory_indicator], every=5)
 
-    # Tips section (remove "Tips for Better AI Collaboration" line)
+    # Tips section
     with gr.Accordion("Tips for Effective Prompts", open=False):
         gr.Markdown("""
         - Be specific about what you want the AIs to accomplish
@@ -386,6 +395,37 @@ with gr.Blocks(css=custom_css, theme=gr.themes.Default()) as demo:
         - For creative work, provide clear parameters and examples
         - For analysis, clearly define the scope and goals
         - Complex tasks often get better results than simple ones, as the AIs can truly collaborate
+        - When uploading files, make sure they're text-based (code, data, documentation)
+        - To use GitHub integration, mention a repository (e.g., "Tell me about repository owner/repo")
+        """)
+    
+    # GitHub MCP info
+    with gr.Accordion("GitHub Integration (MCP)", open=False):
+        gr.Markdown("""
+        ### GitHub Model Context Protocol Integration
+        
+        This interface supports GitHub context enrichment through the Model Context Protocol (MCP).
+        
+        #### How to use:
+        
+        1. **Repository information**: Mention a GitHub repository in your prompt
+           - Example: "Tell me about the repository openai/openai-python"
+        
+        2. **Issue details**: Reference a specific issue
+           - Example: "What's in issue #123 in tensorflow/tensorflow?"
+        
+        3. **Pull request analysis**: Ask about a specific PR
+           - Example: "Analyze PR #456 in facebook/react"
+        
+        #### Setup:
+        
+        To use this feature, you need to have the MCP GitHub server running. In a separate terminal:
+        
+        ```bash
+        npx -y @modelcontextprotocol/server-github
+        ```
+        
+        Make sure your GitHub token is set in the .env file as GITHUB_PERSONAL_ACCESS_TOKEN.
         """)
 
 # Launch with a local URL
